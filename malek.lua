@@ -1,11 +1,9 @@
 --[[
-    MALEK  v1.0
+    MALEK  v1.1
     UNC-first single file. Xeno / Delta / Solara / Wave / Swift / Arceus / Codex.
     Camera-space aimbot with adaptive smoothing, velocity prediction,
-    wall + team filtering, FOV ring, and gated auto fire.
-
-    BindToRenderStep at Camera+1 so our CFrame write lands after the
-    camera scripts and actually sticks.
+    wall + team filtering, FOV ring, gated auto fire, AFK match farming,
+    persisted keybinds and autostart.
 ]]
 
 -- ===================== compat =====================
@@ -15,6 +13,9 @@ local function pick(...)
         if v ~= nil then return v end
     end
 end
+
+local RAW = "https://raw.githubusercontent.com/malikofficialfahad-ai/malekrivalscript/main/malek.lua"
+local LOGO_URL = "https://raw.githubusercontent.com/malikofficialfahad-ai/malekrivalscript/main/logo.png"
 
 local C = {}
 C.executor, C.version = "unknown", ""
@@ -27,12 +28,35 @@ C.gethui        = pick(gethui, function() return nil end)
 C.writefile     = pick(writefile, syn and syn.writefile)
 C.readfile      = pick(readfile, syn and syn.readfile)
 C.isfile        = pick(isfile, syn and syn.isfile)
+C.isfolder      = pick(isfolder, syn and syn.isfolder)
 C.makefolder    = pick(makefolder, syn and syn.makefolder)
+C.delfile       = pick(delfile, syn and syn.delfile)
 C.mouse1press   = pick(mouse1press, syn and syn.mouse1press)
 C.mouse1release = pick(mouse1release, syn and syn.mouse1release)
 C.mouse1click   = pick(mouse1click, syn and syn.mouse1click)
 C.setid         = pick(setthreadidentity, setidentity, syn and syn.set_thread_identity)
+C.customasset   = pick(getcustomasset, getsynasset)
+C.queue_teleport = pick(queue_on_teleport, queueonteleport)
 if C.setid then pcall(C.setid, 7) end
+
+local raw_http
+if http_request then raw_http = http_request
+elseif request then raw_http = request
+elseif syn and syn.request then raw_http = syn.request
+elseif fluxus and fluxus.request then raw_http = fluxus.request
+end
+
+function C.http(o)
+    if raw_http then
+        local ok, r = pcall(raw_http, o)
+        if ok and type(r) == "table" then return r end
+    end
+    if game.HttpGet then
+        local ok, b = pcall(function() return game:HttpGet(o.Url) end)
+        if ok then return { Body = b, StatusCode = 200 } end
+    end
+    return { Body = "", StatusCode = 0 }
+end
 
 local Players = C.cloneref(game:GetService("Players"))
 local Run     = C.cloneref(game:GetService("RunService"))
@@ -46,7 +70,7 @@ local G = getgenv and getgenv() or _G
 if type(G.__MALEK) == "table" and G.__MALEK.unload then pcall(G.__MALEK.unload) end
 
 -- ===================== state =====================
-local conns = {}
+local conns, running = {}, true
 local function track(c) conns[#conns + 1] = c; return c end
 local function untrack_all()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
@@ -58,24 +82,103 @@ local cfg = {
     fovring = true, head = true, teamcheck = true, wallcheck = true,
     prediction = 0.18, assist = false, assiststrength = 35,
     autofire = true, firedelay = 0.06,
+    farm = false, farmdelay = 3, humanize = true, jitter = 40,
 }
 
 local DIR = "Malek"
 local CFG = DIR .. "/config.txt"
+local LOGO = DIR .. "/logo.png"
 if C.makefolder then pcall(C.makefolder, DIR) end
+
+-- ===================== config io =====================
+local keys = {
+    "aimbot", "fov", "smooth", "fovring", "head", "teamcheck", "wallcheck",
+    "prediction", "assist", "assiststrength", "autofire", "firedelay",
+    "farm", "farmdelay", "humanize", "jitter",
+}
+
+local function save()
+    local out = {}
+    for _, k in ipairs(keys) do out[#out + 1] = k .. "=" .. tostring(cfg[k]) end
+    out[#out + 1] = "aimkey=" .. cfg.aimkey.Name
+    if C.writefile then pcall(C.writefile, CFG, table.concat(out, "\n")) end
+end
+
+local function load()
+    if not (C.readfile and C.isfile and C.isfile(CFG)) then return end
+    local ok, data = pcall(C.readfile, CFG)
+    if not ok or not data then return end
+    for line in data:gmatch("[^\r\n]+") do
+        local k, v = line:match("^(%w+)=(.*)$")
+        if k then
+            if k == "aimkey" then
+                local kc = Enum.KeyCode[v]
+                if kc then cfg.aimkey = kc end
+            elseif cfg[k] ~= nil then
+                if type(cfg[k]) == "boolean" then cfg[k] = v == "true"
+                else cfg[k] = tonumber(v) or cfg[k] end
+            end
+        end
+    end
+end
+load()
+
+local save_timer
+local function queue_save()
+    if save_timer then return end
+    save_timer = task.delay(0.4, function() save_timer = nil; save() end)
+end
+
+-- ===================== autostart =====================
+local LOADER = ('loadstring(game:HttpGet("%s?v=2"))()'):format(RAW)
+local AUTO_DIRS = { "autoexec", "AutoExec", "auto_exec", "Xeno/autoexec", "workspace/autoexec", "Malek/autoexec" }
+
+local function install_autostart()
+    if not (C.writefile and C.isfolder) then return "unsupported" end
+    for _, d in ipairs(AUTO_DIRS) do
+        local ok, exists = pcall(C.isfolder, d)
+        if ok and exists then
+            local ok2 = pcall(C.writefile, d .. "/malek_autoload.lua", LOADER)
+            if ok2 then return d end
+        end
+    end
+    return "none"
+end
+local autostart_dir = install_autostart()
+
+if C.queue_teleport then pcall(C.queue_teleport, LOADER) end
+
+-- ===================== logo =====================
+local logo_asset
+do
+    if C.isfile and C.isfile(LOGO) and C.customasset then
+        local ok, a = pcall(C.customasset, LOGO)
+        if ok then logo_asset = a end
+    end
+    if not logo_asset and C.writefile then
+        local r = C.http({ Url = LOGO_URL, Method = "GET" })
+        if r.Body and #r.Body > 500 then
+            pcall(C.writefile, LOGO, r.Body)
+            if C.customasset then
+                local ok, a = pcall(C.customasset, LOGO)
+                if ok then logo_asset = a end
+            end
+        end
+    end
+end
 
 -- ===================== palette =====================
 local COL = {
     bg      = Color3.fromRGB(13, 13, 17),
-    panel   = Color3.fromRGB(19, 19, 24),
-    row     = Color3.fromRGB(27, 27, 34),
-    rowhov  = Color3.fromRGB(35, 35, 44),
-    stroke  = Color3.fromRGB(46, 46, 58),
+    panel   = Color3.fromRGB(17, 16, 22),
+    row     = Color3.fromRGB(27, 26, 34),
+    rowhov  = Color3.fromRGB(36, 34, 45),
+    stroke  = Color3.fromRGB(52, 46, 66),
     accent  = Color3.fromRGB(139, 92, 246),
     accent2 = Color3.fromRGB(34, 211, 238),
-    text    = Color3.fromRGB(234, 234, 242),
-    muted   = Color3.fromRGB(126, 126, 143),
-    off     = Color3.fromRGB(52, 52, 64),
+    text    = Color3.fromRGB(234, 232, 242),
+    muted   = Color3.fromRGB(126, 122, 143),
+    off     = Color3.fromRGB(52, 50, 64),
 }
 local FONT = Enum.Font.GothamMedium
 local FONT_B = Enum.Font.GothamBold
@@ -102,20 +205,19 @@ gui.Parent = root()
 -- ===================== panel =====================
 local panel = Instance.new("Frame")
 panel.Name = "Panel"
-panel.Size = UDim2.fromOffset(292, 436)
+panel.Size = UDim2.fromOffset(300, 466)
 panel.Position = UDim2.fromOffset(28, 28)
 panel.BackgroundColor3 = COL.panel
 panel.BorderSizePixel = 0
 panel.ClipsDescendants = true
 panel.Parent = gui
 corner(panel, 12)
-stroke(panel, COL.stroke, 1, 0.25)
+stroke(panel, COL.stroke, 1, 0.3)
 
 local scale = Instance.new("UIScale")
 scale.Scale = 0.94
 scale.Parent = panel
 
--- top gradient rail
 local rail = Instance.new("Frame")
 rail.Size = UDim2.new(1, 0, 0, 2)
 rail.BackgroundColor3 = Color3.new(1, 1, 1)
@@ -125,15 +227,61 @@ local rg = Instance.new("UIGradient")
 rg.Color = ColorSequence.new(COL.accent, COL.accent2)
 rg.Parent = rail
 
--- header
+-- ===================== minimized restore chip =====================
+local mini = Instance.new("ImageButton")
+mini.Size = UDim2.fromOffset(42, 42)
+mini.Position = panel.Position
+mini.BackgroundColor3 = COL.panel
+mini.BorderSizePixel = 0
+mini.Visible = false
+mini.AutoButtonColor = false
+mini.Image = logo_asset or ""
+mini.Parent = gui
+corner(mini, 12)
+stroke(mini, COL.accent, 1.5, 0.2)
+
+if not logo_asset then
+    local ph = Instance.new("TextLabel")
+    ph.Size = UDim2.fromScale(1, 1)
+    ph.BackgroundTransparency = 1
+    ph.Font = FONT_B
+    ph.TextSize = 16
+    ph.Text = "M"
+    ph.TextColor3 = COL.accent
+    ph.Parent = mini
+end
+
+-- ===================== header =====================
 local head = Instance.new("Frame")
-head.Size = UDim2.new(1, 0, 0, 46)
+head.Size = UDim2.new(1, 0, 0, 54)
 head.BackgroundTransparency = 1
 head.Parent = panel
 
+local avatar = Instance.new("ImageLabel")
+avatar.Size = UDim2.fromOffset(34, 34)
+avatar.Position = UDim2.fromOffset(12, 10)
+avatar.BackgroundColor3 = COL.row
+avatar.BorderSizePixel = 0
+avatar.Image = logo_asset or ""
+avatar.ScaleType = Enum.ScaleType.Crop
+avatar.Parent = head
+corner(avatar, 9)
+stroke(avatar, COL.accent, 1, 0.45)
+
+if not logo_asset then
+    local ph = Instance.new("TextLabel")
+    ph.Size = UDim2.fromScale(1, 1)
+    ph.BackgroundTransparency = 1
+    ph.Font = FONT_B
+    ph.TextSize = 15
+    ph.Text = "M"
+    ph.TextColor3 = COL.accent
+    ph.Parent = avatar
+end
+
 local title = Instance.new("TextLabel")
-title.Size = UDim2.fromOffset(200, 20)
-title.Position = UDim2.fromOffset(16, 11)
+title.Size = UDim2.fromOffset(150, 18)
+title.Position = UDim2.fromOffset(54, 11)
 title.BackgroundTransparency = 1
 title.Font = FONT_B
 title.TextSize = 15
@@ -146,25 +294,25 @@ tg.Color = ColorSequence.new(COL.accent, COL.accent2)
 tg.Parent = title
 
 local sub = Instance.new("TextLabel")
-sub.Size = UDim2.fromOffset(200, 14)
-sub.Position = UDim2.fromOffset(16, 27)
+sub.Size = UDim2.fromOffset(150, 13)
+sub.Position = UDim2.fromOffset(54, 28)
 sub.BackgroundTransparency = 1
 sub.Font = FONT
-sub.TextSize = 10
+sub.TextSize = 9
 sub.TextXAlignment = Enum.TextXAlignment.Left
-sub.Text = "aim suite"
+sub.Text = "v1.1 · aim suite"
 sub.TextColor3 = COL.muted
 sub.Parent = head
 
 local function iconBtn(glyph, x, cb)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.fromOffset(22, 22)
-    b.Position = UDim2.fromOffset(x, 13)
+    b.Size = UDim2.fromOffset(20, 20)
+    b.Position = UDim2.fromOffset(x, 14)
     b.BackgroundColor3 = COL.row
     b.BackgroundTransparency = 0.4
     b.AutoButtonColor = false
     b.Font = FONT_B
-    b.TextSize = 13
+    b.TextSize = 12
     b.Text = glyph
     b.TextColor3 = COL.muted
     b.Parent = head
@@ -176,12 +324,15 @@ local function iconBtn(glyph, x, cb)
 end
 
 local minimized = false
-iconBtn("–", 220, function()
-    minimized = not minimized
-    Tween:Create(panel, TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-        Size = minimized and UDim2.fromOffset(292, 46) or UDim2.fromOffset(292, 436),
-    }):Play()
-end)
+local function set_minimized(v)
+    minimized = v
+    mini.Position = panel.Position
+    panel.Visible = not v
+    mini.Visible = v
+end
+
+iconBtn("–", 254, function() set_minimized(true) end)
+mini.MouseButton1Click:Connect(function() set_minimized(false) end)
 
 -- drag
 do
@@ -207,16 +358,16 @@ end
 -- tabs
 local tabs = Instance.new("Frame")
 tabs.Size = UDim2.new(1, -32, 0, 26)
-tabs.Position = UDim2.fromOffset(16, 52)
+tabs.Position = UDim2.fromOffset(16, 60)
 tabs.BackgroundTransparency = 1
 tabs.Parent = panel
 
 local pages, tabBtns = {}, {}
-local order = { "AIM", "TARGET", "FIRE", "CONFIG" }
+local order = { "AIM", "TGT", "FIRE", "FARM", "CFG" }
 
 local body = Instance.new("Frame")
-body.Size = UDim2.new(1, -32, 1, -130)
-body.Position = UDim2.fromOffset(16, 86)
+body.Size = UDim2.new(1, -32, 1, -142)
+body.Position = UDim2.fromOffset(16, 94)
 body.BackgroundTransparency = 1
 body.Parent = panel
 
@@ -232,12 +383,12 @@ end
 
 for i, name in ipairs(order) do
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0.25, -4, 1, 0)
-    b.Position = UDim2.new((i - 1) * 0.25, (i - 1) * -3 + 2, 0, 0)
+    b.Size = UDim2.new(0.2, -4, 1, 0)
+    b.Position = UDim2.new((i - 1) * 0.2, (i - 1) * -3 + 2, 0, 0)
     b.BackgroundColor3 = COL.row
     b.AutoButtonColor = false
     b.Font = FONT_B
-    b.TextSize = 10
+    b.TextSize = 9
     b.Text = name
     b.TextColor3 = COL.muted
     b.Parent = tabs
@@ -258,9 +409,9 @@ local ycur = {}
 local function yget(page) return ycur[page] or 0 end
 local function yadd(page, n) ycur[page] = yget(page) + n end
 
-local function label(page, txt, h)
+local function label(page, txt)
     local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, 0, 0, h or 18)
+    l.Size = UDim2.new(1, 0, 0, 16)
     l.Position = UDim2.fromOffset(0, yget(page))
     l.BackgroundTransparency = 1
     l.Font = FONT_B
@@ -269,7 +420,7 @@ local function label(page, txt, h)
     l.Text = string.upper(txt)
     l.TextColor3 = COL.muted
     l.Parent = page
-    yadd(page, (h or 18) + 4)
+    yadd(page, 20)
 end
 
 local function row(page, txt)
@@ -297,7 +448,7 @@ local function row(page, txt)
     return f
 end
 
-local function toggle(page, txt, key)
+local function toggle(page, txt, key, cb)
     local f = row(page, txt)
     local pill = Instance.new("Frame")
     pill.Size = UDim2.fromOffset(34, 18)
@@ -324,6 +475,8 @@ local function toggle(page, txt, key)
         Tween:Create(pill, TweenInfo.new(0.15, Enum.EasingStyle.Quart), { BackgroundColor3 = cfg[key] and COL.accent or COL.off }):Play()
         Tween:Create(knob, TweenInfo.new(0.15, Enum.EasingStyle.Quart), { Position = UDim2.fromOffset(cfg[key] and 18 or 2, 2) }):Play()
         if key == "fovring" then fovring.Visible = cfg.fovring end
+        if cb then cb(cfg[key]) end
+        save()
     end)
 end
 
@@ -405,7 +558,9 @@ local function slider(page, txt, key, min, max, suffix)
             end)
             local up
             up = UIS.InputEnded:Connect(function(m)
-                if m.UserInputType == i.UserInputType then mv:Disconnect() up:Disconnect() end
+                if m.UserInputType == i.UserInputType then
+                    mv:Disconnect(); up:Disconnect(); save()
+                end
             end)
         end
     end)
@@ -437,6 +592,7 @@ local function keybind(page, txt, key)
         cfg[key] = i.KeyCode
         chip.Text = i.KeyCode.Name
         waiting = false
+        save()
     end))
 end
 
@@ -450,6 +606,7 @@ local function action(page, txt, cb)
     hit.MouseButton1Click:Connect(cb)
     local l = f:FindFirstChildOfClass("TextLabel")
     if l then l.TextColor3 = COL.accent2 end
+    return f
 end
 
 -- ===================== pages =====================
@@ -460,34 +617,54 @@ slider(pages.AIM, "Field of view", "fov", 20, 600, "px")
 slider(pages.AIM, "Smoothing speed", "smooth", 1, 20, "")
 toggle(pages.AIM, "FOV ring", "fovring")
 
-label(pages.TARGET, "filtering")
-toggle(pages.TARGET, "Headshot priority", "head")
-toggle(pages.TARGET, "Team check", "teamcheck")
-toggle(pages.TARGET, "Wall check", "wallcheck")
-slider(pages.TARGET, "Prediction", "prediction", 0, 100, "%")
+label(pages.TGT, "filtering")
+toggle(pages.TGT, "Headshot priority", "head")
+toggle(pages.TGT, "Team check", "teamcheck")
+toggle(pages.TGT, "Wall check", "wallcheck")
+slider(pages.TGT, "Prediction", "prediction", 0, 100, "%")
 
 label(pages.FIRE, "trigger")
 toggle(pages.FIRE, "Auto fire", "autofire")
 slider(pages.FIRE, "Fire interval", "firedelay", 1, 30, "0ms")
 
-label(pages.CONFIG, "assist")
-toggle(pages.CONFIG, "Aim assist (always on)", "assist")
-slider(pages.CONFIG, "Assist strength", "assiststrength", 5, 100, "%")
+label(pages.FARM, "afk farming")
+toggle(pages.FARM, "Auto farm matches", "farm")
+slider(pages.FARM, "Between-match delay", "farmdelay", 1, 12, "s")
+toggle(pages.FARM, "Humanizer", "humanize")
+slider(pages.FARM, "Aim jitter", "jitter", 0, 120, "")
 
-label(pages.CONFIG, "preset")
-action(pages.CONFIG, "Save config", function() save() end)
-action(pages.CONFIG, "Load config", function() load() end)
-action(pages.CONFIG, "Unload", function() G.__MALEK.unload() end)
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, 0, 0, 16)
+status.Position = UDim2.fromOffset(0, yget(pages.FARM))
+status.BackgroundTransparency = 1
+status.Font = FONT
+status.TextSize = 10
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Text = "idle"
+status.TextColor3 = COL.muted
+status.Parent = pages.FARM
+
+label(pages.CFG, "assist")
+toggle(pages.CFG, "Aim assist (always on)", "assist")
+slider(pages.CFG, "Assist strength", "assiststrength", 5, 100, "%")
+
+label(pages.CFG, "system")
+action(pages.CFG, "Save config", function() save() end)
+action(pages.CFG, "Reinstall autostart", function()
+    local d = install_autostart()
+    status.Text = d == "none" and "no autoexec folder" or (d == "unsupported" and "no file access" or "installed: " .. d)
+end)
+action(pages.CFG, "Unload", function() G.__MALEK.unload() end)
 
 -- footer
 local foot = Instance.new("TextLabel")
-foot.Size = UDim2.new(1, -32, 0, 14)
-foot.Position = UDim2.new(0, 16, 1, -24)
+foot.Size = UDim2.new(1, -32, 0, 13)
+foot.Position = UDim2.new(0, 16, 1, -22)
 foot.BackgroundTransparency = 1
 foot.Font = FONT
 foot.TextSize = 9
 foot.TextXAlignment = Enum.TextXAlignment.Left
-foot.Text = C.executor .. "  ·  " .. C.version
+foot.Text = C.executor .. (autostart_dir ~= "none" and autostart_dir ~= "unsupported" and "  ·  autostart on" or "")
 foot.TextColor3 = COL.muted
 foot.Parent = panel
 
@@ -513,13 +690,84 @@ corner(dot, 2)
 
 local function sync_ring()
     scalei = Camera.ViewportSize.Y / 1080
-    local d = cfg.fov * 2 * scalei
-    fovring.Size = UDim2.fromOffset(d, d)
+    fovring.Size = UDim2.fromOffset(cfg.fov * 2 * scalei, cfg.fov * 2 * scalei)
 end
 sync_ring()
 
+-- ===================== farm engine =====================
+local farm_state, farm_t = "idle", 0
+local PLAY_PATTERNS = { "play", "queue", "find match", "start", "rematch", "again", "next", "continue" }
+
+local function find_play()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return nil end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("GuiButton") and d.Visible and d.AbsoluteSize.X > 8 then
+            local t = string.lower(d:IsA("TextButton") and d.Text or "")
+            for _, p in ipairs(PLAY_PATTERNS) do
+                if string.find(t, p, 1, true) then return d end
+            end
+        end
+    end
+end
+
+local function click(b)
+    if getconnections then
+        local ok, cs = pcall(getconnections, b.MouseButton1Click)
+        if ok and cs and cs[1] then
+            if pcall(function() cs[1]:Fire() end) then return end
+        end
+    end
+    local pos = b.AbsolutePosition + b.AbsoluteSize * 0.5
+    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+    task.wait(0.05)
+    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+end
+
+local function in_match()
+    local ch = LP.Character
+    if not ch then return false end
+    local hum = ch:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+task.spawn(function()
+    while running do
+        task.wait(0.4)
+        if not cfg.farm then farm_state = "idle"; status.Text = "idle"; continue end
+        if farm_state == "cooldown" then
+            farm_t -= 0.4
+            status.Text = "cooldown " .. math.ceil(farm_t) .. "s"
+            if farm_t <= 0 then farm_state = "idle" end
+            continue
+        end
+        if in_match() and not find_play() then
+            if farm_state ~= "match" then
+                farm_state = "match"
+                status.Text = "in match"
+            end
+            continue
+        end
+        farm_state = "lobby"
+        status.Text = "looking for queue"
+        local b = find_play()
+        if b then
+            local delay = cfg.farmdelay
+            if cfg.humanize then delay = delay + math.random() * 2.5 end
+            status.Text = "queueing in " .. string.format("%.1f", delay) .. "s"
+            task.wait(delay)
+            if not cfg.farm then continue end
+            pcall(click, b)
+            farm_t = 4 + math.random() * 3
+            farm_state = "cooldown"
+            status.Text = "clicked"
+        end
+    end
+end)
+
 -- ===================== aim engine =====================
-local holding, current, firing, lastClick = false, nil, false, 0
+local holding, firing, lastClick = false, false, 0
+local hgate, hgt, jx, jy, jt = true, 0, 0, 0, 0
 
 local function part_of(char)
     if cfg.head then
@@ -561,9 +809,7 @@ local function select_target()
                             rp.FilterDescendantsInstances = { p.Character, LP.Character, Camera }
                             clear = workspace:Raycast(origin, part.Position - origin, rp) == nil
                         end
-                        if clear then
-                            best, bestscore = p, d
-                        end
+                        if clear then best, bestscore = p, d end
                     end
                 end
             end
@@ -587,50 +833,70 @@ end
 
 local function step(dt)
     if not Camera then return end
-    local t = select_target()
-    current = t
 
-    local engaged = t and (holding and cfg.aimbot or cfg.assist)
+    if cfg.humanize then
+        hgt -= dt
+        if hgt <= 0 then
+            hgt = 0.25 + math.random() * 1.2
+            hgate = math.random() > 0.18
+        end
+        jt -= dt
+        if jt <= 0 then
+            jt = 0.1 + math.random() * 0.25
+            jx = (math.random() - 0.5) * cfg.jitter * 0.01
+            jy = (math.random() - 0.5) * cfg.jitter * 0.01
+        end
+    end
+
+    local t = select_target()
+    local auto = cfg.farm and farm_state == "match"
+    local engaged = t and ((holding and cfg.aimbot) or cfg.assist or auto)
+
     if not engaged then
-        if cfg.autofire then fire(false) end
+        if cfg.autofire or auto then fire(false) end
         return
     end
 
-    local char = t.Character
-    local part = part_of(char)
+    local part = part_of(t.Character)
     if not part then return end
 
     local origin = Camera.CFrame.Position
     local dest = part.Position
+    local dist = (dest - origin).Magnitude
+
     if cfg.prediction > 0 then
-        local travel = (dest - origin).Magnitude / 1200
-        dest = dest + part.AssemblyLinearVelocity * travel * (cfg.prediction / 100)
+        dest = dest + part.AssemblyLinearVelocity * (dist / 1200) * (cfg.prediction / 100)
+    end
+    if cfg.humanize and cfg.jitter > 0 then
+        dest = dest + Camera.CFrame.RightVector * (jx * dist * 0.01)
+                    + Camera.CFrame.UpVector * (jy * dist * 0.01)
     end
 
     local look = Camera.CFrame.LookVector
-    local dir = (dest - origin).Unit
-    local ang = math.deg(math.acos(math.clamp(look:Dot(dir), -1, 1)))
+    local ang = math.deg(math.acos(math.clamp(look:Dot((dest - origin).Unit), -1, 1)))
 
-    local power = holding and cfg.aimbot and cfg.smooth or (cfg.smooth * cfg.assiststrength / 100)
+    local power = (holding and cfg.aimbot) and cfg.smooth or (cfg.smooth * cfg.assiststrength / 100)
+    if auto and not holding then power = cfg.smooth * 0.8 end
     local base = math.clamp(power * dt * 9, 0, 1)
     local boost = math.clamp(ang / 22, 0, 1) * 0.4
     local alpha = math.clamp(base + boost, 0, 1)
 
     Camera.CFrame = Camera.CFrame:Lerp(CFrame.lookAt(origin, dest), alpha)
 
-    if cfg.autofire then
-        local sp = Camera:WorldToViewportPoint(dest)
-        local gate = (Vector2.new(sp.X, sp.Y) - Camera.ViewportSize * 0.5).Magnitude
-        local inrange = gate <= math.max(24, cfg.fov * (Camera.ViewportSize.Y / 1080) * 0.55)
-        if inrange then
-            if C.mouse1press then
-                fire(true)
-            elseif os.clock() - lastClick >= cfg.firedelay / 100 then
-                fire(false); fire(true)
-            end
-        else
-            fire(false)
+    local wants_fire = cfg.autofire or auto
+    if not wants_fire then return end
+    if cfg.humanize and not hgate then fire(false); return end
+
+    local sp = Camera:WorldToViewportPoint(dest)
+    local gate = (Vector2.new(sp.X, sp.Y) - Camera.ViewportSize * 0.5).Magnitude
+    if gate <= math.max(24, cfg.fov * (Camera.ViewportSize.Y / 1080) * 0.55) then
+        if C.mouse1press then
+            fire(true)
+        elseif os.clock() - lastClick >= cfg.firedelay / 100 then
+            fire(false); fire(true)
         end
+    else
+        fire(false)
     end
 end
 
@@ -643,15 +909,12 @@ end)
 track(UIS.InputBegan:Connect(function(i, gp)
     if gp then return end
     if i.KeyCode == cfg.aimkey then holding = true end
+    if i.KeyCode == Enum.KeyCode.LeftControl then
+        set_minimized(not minimized)
+    end
 end))
 track(UIS.InputEnded:Connect(function(i)
     if i.KeyCode == cfg.aimkey then holding = false end
-end))
-track(UIS.InputBegan:Connect(function(i, gp)
-    if gp then return end
-    if i.KeyCode == Enum.KeyCode.RightShift then
-        panel.Visible = not panel.Visible
-    end
 end))
 
 track(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
@@ -659,39 +922,11 @@ track(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
 end))
 track(Camera:GetPropertyChangedSignal("ViewportSize"):Connect(sync_ring))
 
--- ===================== config =====================
-local keys = { "aimbot", "fov", "smooth", "fovring", "head", "teamcheck", "wallcheck", "prediction", "assist", "assiststrength", "autofire", "firedelay" }
-
-function save()
-    local out = {}
-    for _, k in ipairs(keys) do out[#out + 1] = k .. "=" .. tostring(cfg[k]) end
-    out[#out + 1] = "aimkey=" .. cfg.aimkey.Name
-    if C.writefile then pcall(C.writefile, CFG, table.concat(out, "\n")) end
-end
-
-function load()
-    if not (C.readfile and C.isfile) then return end
-    local ok, data = pcall(C.readfile, CFG)
-    if not ok or not data then return end
-    for line in data:gmatch("[^\r\n]+") do
-        local k, v = line:match("^(%w+)=(.*)$")
-        if k then
-            if k == "aimkey" then
-                local kc = Enum.KeyCode[v]
-                if kc then cfg.aimkey = kc end
-            elseif cfg[k] ~= nil then
-                if type(cfg[k]) == "boolean" then cfg[k] = v == "true"
-                else cfg[k] = tonumber(v) or cfg[k] end
-            end
-        end
-    end
-end
-load()
-
 -- ===================== unload =====================
 G.__MALEK = {
     cfg = cfg,
     unload = function()
+        running = false
         pcall(function() Run:UnbindFromRenderStep("Malek") end)
         fire(false)
         untrack_all()
@@ -700,6 +935,5 @@ G.__MALEK = {
     end,
 }
 
--- entrance
 Tween:Create(scale, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { Scale = 1 }):Play()
 switch("AIM")
